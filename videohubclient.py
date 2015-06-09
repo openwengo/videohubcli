@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 Copyright (c) 2015, Olivier Schiavo / Wengo SAS
 All rights reserved.
