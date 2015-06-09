@@ -26,20 +26,31 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import asyncore, socket
 import sys
 import collections
+import argparse
 
 READ_BUFF_SIZE=8192
 
+def RepresentsInt(s):
+  try: 
+      int(s)
+      return True
+  except ValueError:
+      return False
+
 class VideoHubClient(asyncore.dispatcher):
-  def __init__(self, host, port = 9990):
+  def __init__(self, host, port = 9990,interactive=True,confirm=True,setroute="",verbose=False):
     asyncore.dispatcher.__init__(self)
-    #sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-    #sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    #sock.connect((host, port))
+
     self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
     self.connect((host, port))
-    ## Init dispatcher with request
+
     self.is_init = False
-    self.protocol_version = "?"
+    self.interactive = interactive
+    self.confirm = confirm
+    self.setroute = setroute
+    self.verbose = verbose
+    # Device informations
+    self.protocol_version = "?"     # Protocol Preamble
     self.device_present = False
     self.model_name = "?"
     self.friendly_name = "?"
@@ -54,6 +65,11 @@ class VideoHubClient(asyncore.dispatcher):
     self.video_output_locks = {}
     self.video_output_routing = {}
 
+    # write buffer
+    self.buffer=''
+    # pre-confirmation buffer
+    self.prebuffer=''
+
   def handle_connect(self):
    print "Connected"
    pass
@@ -64,6 +80,16 @@ class VideoHubClient(asyncore.dispatcher):
 
   def serve_forever(self):
     asyncore.loop(count = 100)
+
+  def confirm_action(self):
+    if len(self.prebuffer) > 0:
+      self.buffer = self.prebuffer
+      self.prebuffer = ''
+
+  def cancel_action(self):
+    if len(self.prebuffer) > 0:
+      print "action cancelled"
+      self.prebuffer = ''
 
   def print_status(self):
    print "Status:"
@@ -96,6 +122,54 @@ class VideoHubClient(asyncore.dispatcher):
     for key in outputs_ordered:
       print "%3d:%-32.32s" % ( int(key), self.output_labels[key])
 
+  def change_route(self, route_input, route_output):
+     route_input = str(route_input)
+     route_output = str(route_output)
+     if not RepresentsInt(route_input):
+       for key in self.input_labels:
+          if self.input_labels[key] == route_input:
+             route_input = key
+             break
+     if not RepresentsInt(route_output):
+       for key in self.output_labels:
+          if self.output_labels[key] == route_output:
+             route_output = key
+             break
+     if not( str(route_input) in self.input_labels):
+        print "There is no input:%s" % route_input
+        return False
+     if not( str(route_output) in self.output_labels):
+        print "There is no output:%s" % route_output
+        return False
+     print "Route ", self.input_labels[str(route_input)], " to ", self.output_labels[str(route_output)]
+     cmd = "VIDEO OUTPUT ROUTING:\n%s %s\n\n" % (str(route_output), str(route_input))
+     if self.confirm:
+        print "type yes to confirm, anything else to discard"
+        self.prebuffer = cmd
+     else:
+        self.buffer = cmd
+
+  def change_input_label(self, input_number, input_label):
+     if not(str(input_number) in self.input_labels):
+       print "There is no input:%s" % input_number
+       return False 
+     cmd = "INPUT LABELS:\n%i %s\n\n" % (int(input_number), input_label)
+     if self.confirm:
+        print "type yes to confirm, anything else to discard"
+        self.prebuffer = cmd
+     else:
+        self.buffer = cmd
+
+  def change_output_label(self, output_number, output_label):
+     if not(str(output_number) in self.output_labels):
+       print "There is no output:%s" % output_number
+       return False 
+     cmd = "OUTPUT LABELS:\n%i %s\n\n" % (int(output_number), output_label)
+     if self.confirm:
+        print "type yes to confirm, anything else to discard"
+        self.prebuffer = cmd
+     else:
+        self.buffer = cmd
 
   def handle_read(self):
    message = ""
@@ -192,6 +266,13 @@ class VideoHubClient(asyncore.dispatcher):
            self.video_output_routing[ input_line[0]] = input_line[1]
        self.print_routing()
 
+  def handle_write(self):
+   sent = self.send(self.buffer)
+   self.buffer = self.buffer[sent:]
+
+  def writable(self):
+   return (len(self.buffer) > 0)
+
 class CmdlineClient(asyncore.file_dispatcher):
   def __init__(self, videohub, file):
     asyncore.file_dispatcher.__init__(self, file)
@@ -200,7 +281,21 @@ class CmdlineClient(asyncore.file_dispatcher):
   def handle_read(self):
     message = self.recv(1024)
     #print "Read keyboard read:", message
-    if message.startswith("show routing"):
+    message=message.strip(" \n")
+    if message == "yes":
+       self.videohub.confirm_action()
+       return
+    self.videohub.cancel_action()
+    if message.startswith("help"):
+       print "Commands:"
+       print "show routing              : current routing table"
+       print "show status               : device information"
+       print "show inputs               : list of inputs labels"
+       print "show outputs              : list of output labels"
+       print "route <input> to <output> : change routing. <input> and <output> are integers or labels"
+       print "set input label <input> to <Label> : change input label. <input> is 0-indexed integer"
+       print "set output label <output> to <Label> : change output label. <output> is 0-indexed integer"
+    elif message.startswith("show routing"):
        self.videohub.print_routing()
     elif message.startswith("show status"):
        self.videohub.print_status()
@@ -208,34 +303,94 @@ class CmdlineClient(asyncore.file_dispatcher):
        self.videohub.print_inputs()
     elif message.startswith("show outputs"):
        self.videohub.print_outputs()
+    elif message.startswith("route "):
+       message_direction = message[6:]
+       directions = message_direction.split(' to ')
+       if len(directions) != 2:
+            print "Invalid direction:", message_direction
+       else:
+            self.videohub.change_route(directions[0].strip(), directions[1].strip())
+    elif message.startswith("set input label "):
+       message_direction = message[16:]
+       directions = message_direction.split(' to ')
+       if len(directions) != 2:
+            print "Invalid set label target:", message_direction
+       else:
+            self.videohub.change_input_label(directions[0].strip(), directions[1].strip())
+    elif message.startswith("set output label "):
+       message_direction = message[17:]
+       directions = message_direction.split(' to ')
+       if len(directions) != 2:
+            print "Invalid set label target:", message_direction
+       else:
+            self.videohub.change_output_label(directions[0].strip(), directions[1].strip())
     elif len(message) <= 1:
        pass
     else:
-       print "Unknown command:", message
+       print "Unknown command:", message, "."
 
   def serve_forever(self):
     asyncore.loop(count = 100)
 
 
-if __name__ == '__main__':
-  if len(sys.argv) > 1:
-    host = sys.argv[1]
-  else:
-    print "Usage: ", sys.argv[0], " <videohubhostname>[:port]"
-    sys.exit(1)
-  input_line = host.split(':',1)
+def main():
+  verbose=False
+  interactive=True
+  confirm=True
+  setroute=""
+
+  parser =argparse.ArgumentParser(description='Parameters for videohubclient')
+  parser.add_argument("-v","--verbose", default=False, required=False,help="Verbose mode",action="store_true")
+  parser.add_argument("--nointeractive",  required=False, default=False, help="Non-interactive mode",action="store_true")
+  parser.add_argument("--noconfirm",  required=False, default=False, help="Do not confirm changes",action="store_true")
+  parser.add_argument("--host", required=True,help="VideoHub Hostname[:port]")
+  parser.add_argument("--setroute", required=False, default="", help="'<input> to <output>'. Implies noconfirm and nointeractive")
+  args = parser.parse_args()
+
+  if args.verbose:
+    verbose=True
+  if args.nointeractive:
+   interactive=False
+   confirm=False
+  if args.noconfirm:
+   confirm=False
+  if len(args.setroute) > 0:
+   confirm=False
+   interactive=False
+   setroute=args.setroute
+
+  input_line = args.host.split(':',1)
   if len(input_line) == 2:
      port = int(input_line[1])
      host = input_line[0]
   else:
+     host = args.host
      port = 9990
-  videohub = VideoHubClient(host=host, port =port)
+  
+  if len(args.setroute) > 0:
+    directions = args.setroute.split(' to ')
+    if len(directions) != 2:
+        sys.stderr.write("Invalid direction:", args.setroute)
+        sys.exit(1)
+  else:
+    directions = []
+  videohub = VideoHubClient(host=host, port =port, interactive=interactive,confirm=confirm,verbose=verbose)
   cmdline = CmdlineClient(videohub=videohub, file=sys.stdin)
   iter_count = 0
+  order_sent = False
   while(True):
     iter_count+=1
     videohub.serve_forever()
-    cmdline.serve_forever()
+    if interactive:
+       cmdline.serve_forever()
     if (iter_count > 1000 ) and ( videohub.device_present == False):
-       print "Timeout connecting.."
-       sys.exit(1)
+       sys.stderr.write("Timeout connecting to %s" % (args.host))
+       sys.exit(2)
+    if (iter_count > 1000 ) and videohub.device_present and not(interactive):
+       break
+    if (iter_count > 100 ) and videohub.device_present and len(directions) == 2 and not(order_sent):
+        videohub.change_route(directions[0].strip(), directions[1].strip())
+        order_sent = True
+
+if __name__ == '__main__':
+  main() 
