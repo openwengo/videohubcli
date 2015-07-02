@@ -330,6 +330,10 @@ class CmdlineClient(asyncore.file_dispatcher):
     else:
        print "Unknown command:", message, "."
 
+  def writable(self):
+   # we cannot write to the keyboard..
+   return False
+
   def serve_forever(self):
     asyncore.loop(count = 100)
 
